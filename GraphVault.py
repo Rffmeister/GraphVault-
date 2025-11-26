@@ -1,10 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-GRAPH VAULT 2.2 – LA VERSIÓN QUE TODOS QUERÍAN (AHORA SÍ DE VERDAD)
-→ Carpetas y archivos suben siempre juntos (da igual el modo)
-→ MOC creado desde el primer archivo
-→ Modo FOLDERS ahora también copia/enlaza archivos → progreso REAL
-→ Consola aún más épica
+GraphVault v2.3 – Ultra-fast Auto-MOC Generator + Smart Sync for Obsidian
+Pure Python • Zero plugins • Blazing fast
 """
 
 import os
@@ -15,19 +12,20 @@ import shutil
 import gzip
 from pathlib import Path
 from collections import defaultdict, deque
+from datetime import datetime
 
-# ==================== CONFIGURACIÓN ====================
+# ==================== CONFIGURATION ====================
 SCRIPT_DIR = Path(__file__).parent
 INPUT_FOLDER = SCRIPT_DIR / "input"
 OUTPUT_FOLDER = SCRIPT_DIR / "graph-vault-archivos"
 ATTACHMENTS_FOLDER = OUTPUT_FOLDER / "!_adjuntos"
 CHECKPOINT_FILE = SCRIPT_DIR / "graph_checkpoint_v2.json.gz"
 LOCK_FILE = SCRIPT_DIR / "graph_vault.lock"
+LOG_FILE = SCRIPT_DIR / "graph_vault.log"
 
 BATCH_SIZES = [100, 200, 300, 500, 750, 1000, 1500, 2000, 3000, 5000]
-DEFAULT_BATCH_INDEX = 5  # arrancamos en 750 (el punto dulce)
-
-MAX_FILE_SIZE = 2 * 1024 * 1024  # 2 MB → se copian, más grandes → proxy
+DEFAULT_BATCH_INDEX = 2
+MAX_FILE_SIZE = 2 * 1024 * 1024  # 2 MB
 
 TEXT_EXT = {'.md', '.txt', '.pdf', '.docx', '.doc', '.rtf'}
 CODE_EXT = {'.py', '.js', '.ts', '.jsx', '.html', '.css', '.java', '.cpp', '.c', '.go', '.rs', '.json', '.yaml', '.xml'}
@@ -42,6 +40,29 @@ IGNORE_DIRS = {".obsidian", ".git", ".trash", "attachments", "images", "img", "a
                "Thumbs.db", ".DS_Store"}
 
 # =========================================================
+# LOG + PROGRESS BAR
+# =========================================================
+
+def log(msg: str):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] {msg}"
+    try:
+        LOG_FILE.open("a", encoding="utf-8").write(line + "\n")
+    except: pass
+
+def print_progress(done: int, total: int, prefix: str = "", length: int = 50):
+    if total == 0:
+        percent = 100.0
+    else:
+        percent = 100 * (done / total)
+    filled = int(length * done // total) if total > 0 else length
+    bar = "█" * filled + "░" * (length - filled)
+    line = f"\r{prefix} |{bar}| {done:,}/{total:,} ({percent:6.2f}%)"
+    print(line, end="", flush=True)
+    if done == total or done == 0:
+        print()
+
+# =========================================================
 
 class WindowsLock:
     def __init__(self, lock_file): self.lock_file = lock_file; self.acquired = False
@@ -49,7 +70,7 @@ class WindowsLock:
         if self.lock_file.exists():
             try:
                 pid = self.lock_file.read_text().strip()
-                print(f"YA HAY OTRA INSTANCIA (PID {pid}) → CIÉRRALA")
+                print(f"\nAnother instance is already running (PID {pid}) → Close it first!")
                 sys.exit(1)
             except: pass
         self.lock_file.write_text(str(os.getpid()))
@@ -72,39 +93,53 @@ class GraphVaultPro:
         self.processed_folders = set()
         self.processed_files = set()
         self.stats = {"copied": 0, "linked": 0, "batches": 0}
-        self.mode = "folders"        # ahora es el modo rey
+        self.mode = "folders"
         self.batch_idx = DEFAULT_BATCH_INDEX
 
-        print("Iniciando Graph Vault 2.2 – LA BESTIA DEFINITIVA")
+        print("GraphVault v2.3 – Ultra-fast Auto-MOC Generator")
+        log("=== GraphVault v2.3 STARTED ===")
         self.load_checkpoint()
         if not self.folders:
             self.scan()
         else:
-            print(f"Estructura cargada: {len(self.folders):,} carpetas")
+            log(f"Structure loaded: {len(self.folders):,} folders")
 
     def scan(self):
-        print("Escaneando carpeta input (BFS)... ", end="", flush=True)
+        print("Scanning input folder...", flush=True)
+        log("Scanning...")
         start = time.time()
         self.folders.clear()
 
         queue = deque([(self.input, 0)])
-        total_files = 0
-        folder_count = 0
+        total_files = folder_count = scanned = 0
 
         while queue:
             folder, level = queue.popleft()
+            scanned += 1
+            if scanned % 100 == 0 or not queue:
+                print(f"\rScanning... {scanned + len(queue):,} folders processed", end="", flush=True)
+
             rel = folder.relative_to(self.input)
             rel_str = str(rel) if rel != Path('.') else ''
 
             if folder.name in IGNORE_DIRS or folder.name.startswith('.'):
                 continue
 
-            for sub in folder.iterdir():
+            try:
+                entries = list(folder.iterdir())
+            except (PermissionError, OSError):
+                log(f"Access denied: {folder}")
+                continue
+
+            files = []
+
+            # Subfolders first
+            for sub in entries:
                 if sub.is_dir() and sub.name not in IGNORE_DIRS and not sub.name.startswith('.'):
                     queue.append((sub, level + 1))
 
-            files = []
-            for f in folder.iterdir():
+            # Files
+            for f in entries:
                 if f.is_file() and f.suffix.lower() in ALL_EXT and not f.name.startswith('.'):
                     info = self.analyze_file(f)
                     if info:
@@ -113,43 +148,36 @@ class GraphVaultPro:
 
             if files or level == 0:
                 self.folders[rel_str] = {
-                    "path": folder,
-                    "rel": rel,
-                    "name": folder.name if rel_str else "ROOT",
-                    "level": level,
-                    "files": files,
-                    "file_count": len(files),
-                    "children": [],
-                    "parent": str(rel.parent) if rel_str and rel.parent != Path('.') else None
+                    "path": folder, "rel": rel, "name": folder.name if rel_str else "ROOT",
+                    "level": level, "files": files, "file_count": len(files),
+                    "children": [], "parent": str(rel.parent) if rel_str and rel.parent != Path('.') else None
                 }
                 folder_count += 1
-                if folder_count % 1000 == 0:
-                    print(f"{folder_count:,} carpetas...", end="", flush=True)
 
-        # Jerarquía
+        # Build tree
         for key, info in self.folders.items():
             if info["parent"] and info["parent"] in self.folders:
                 self.folders[info["parent"]]["children"].append(key)
-
         for info in self.folders.values():
             info["children"].sort(key=lambda x: self.folders[x]["name"].lower())
 
         elapsed = time.time() - start
-        print(f"\nEscaneo completo → {len(self.folders):,} carpetas | {total_files:,} archivos | {elapsed:.1f}s")
+        print(f"\nDone → {folder_count:,} folders | {total_files:,} files | {elapsed:.1f}s")
+        log(f"Scan completed in {elapsed:.1f}s → {folder_count:,} folders")
 
     def analyze_file(self, path: Path):
         try:
             size = path.stat().st_size
             ext = path.suffix.lower()
-            cat = "otros"
-            if ext in TEXT_EXT: cat = "texto"
-            elif ext in CODE_EXT: cat = "código"
+            cat = "other"
+            if ext in TEXT_EXT: cat = "text"
+            elif ext in CODE_EXT: cat = "code"
             elif ext in MEDIA_EXT:
-                if ext in {'.jpg','.jpeg','.png','.gif','.webp','.svg'}: cat = "imagen"
+                if ext in {'.jpg','.jpeg','.png','.gif','.webp','.svg'}: cat = "image"
                 elif ext in {'.mp4','.mov','.avi','.mkv'}: cat = "video"
                 else: cat = "audio"
-            elif ext in {'.csv','.db','.sqlite'}: cat = "datos"
-            elif ext in {'.zip','.rar','.7z'}: cat = "archivo"
+            elif ext in {'.csv','.db','.sqlite'}: cat = "data"
+            elif ext in {'.zip','.rar','.7z'}: cat = "archive"
 
             return {
                 "path": path, "name": path.name, "stem": path.stem, "ext": ext,
@@ -158,54 +186,26 @@ class GraphVaultPro:
             }
         except: return None
 
-    def get_pending_folders(self):
+    def process_batch(self):
         pending = [k for k in self.folders if k not in self.processed_folders]
         pending.sort(key=lambda x: (self.folders[x]["level"], self.folders[x]["name"].lower()))
-        return pending
-
-    # ←←← LA FUNCIÓN MÁGICA QUE LO ARREGLA TODO ←←←
-    def process_folder_files(self, rel_str: str):
-        info = self.folders[rel_str]
-        out_folder = self.output / rel_str
-        out_folder.mkdir(parents=True, exist_ok=True)
-
-        added = 0
-        for f in info["files"]:
-            if str(f["rel"]) not in self.processed_files:
-                self.copy_or_link_file(f, out_folder)
-                self.processed_files.add(str(f["rel"]))
-                added += 1
-
-        # MOC actualizado con los nuevos archivos
-        self.create_moc_for_folder(rel_str)
-
-        # Si ya están todos → marcamos carpeta como completada
-        if len(info["files"]) == sum(1 for f in info["files"] if str(f["rel"]) in self.processed_files):
-            self.processed_folders.add(rel_str)
-
-        return added
-
-    def process_batch(self):
-        pending = self.get_pending_folders()
         if not pending:
-            print("\nCOMPLETADO 100% – ¡TU VAULT ESTÁ LISTO!")
+            print("100% COMPLETED")
+            log("ALL FOLDERS PROCESSED")
             self.create_root_index()
             return
 
         total = len(self.folders)
         done = len(self.processed_folders)
-        batch_size = BATCH_SIZES[self.batch_idx]
-        batch = pending[:batch_size]
+        batch = pending[:BATCH_SIZES[self.batch_idx]]
 
-        print(f"\nCarpetas {done:,}/{total:,} → Procesando lote de {len(batch)} carpetas", flush=True)
+        print(f"\nFOLDERS → +{len(batch)}", flush=True)
+        log(f"Processing folder batch: +{len(batch)}")
 
         for i, rel_str in enumerate(batch, 1):
-            added_files = self.process_folder_files(rel_str)
-            self.processed_folders.add(rel_str)  # siempre la marcamos (aunque tenga 0 archivos)
-
-            if i % 50 == 0 or i == len(batch):
-                current_done = len(self.processed_folders)
-                print(f"   Carpetas {current_done:,}/{total:,}  |  +{added_files} archivos en esta carpeta", flush=True)
+            self.create_moc_for_folder(rel_str)
+            self.processed_folders.add(rel_str)
+            print_progress(done + i, total, prefix="FOLDERS")
 
         self.stats["batches"] += 1
         self.save_checkpoint()
@@ -219,14 +219,13 @@ class GraphVaultPro:
         out_path.mkdir(parents=True, exist_ok=True)
         moc_path = out_path / f"{info['name']}.md"
 
-        lines = [f"# {info['name']}\n", f"*Nivel {info['level']} | {info['file_count']} archivos*\n\n"]
+        lines = [f"# {info['name']}\n", f"*Level {info['level']} | {info['file_count']} files*\n\n"]
 
         if info["parent"] and info["parent"] in self.folders:
-            parent_name = self.folders[info["parent"]]["name"]
-            lines += [f"## Nivel Superior\n- [[{parent_name}]]\n\n"]
+            lines += [f"## Parent\n- [[{self.folders[info['parent']]['name']}]]\n\n"]
 
         if info["children"]:
-            lines.append("## Subcarpetas\n")
+            lines.append("## Subfolders\n")
             for child in info["children"]:
                 lines.append(f"- [[{self.folders[child]['name']}]]\n")
             lines.append("\n")
@@ -236,20 +235,18 @@ class GraphVaultPro:
         for f in processed_files:
             by_cat[f["cat"]].append(f)
 
-        added = False
-        for cat in ["texto", "código", "imagen", "video", "audio", "datos", "archivo", "otros"]:
+        for cat in ["text", "code", "image", "video", "audio", "data", "archive", "other"]:
             if cat in by_cat:
                 lines.append(f"## {cat.title()}\n")
                 for f in sorted(by_cat[cat], key=lambda x: x["name"].lower()):
                     link = self.get_obsidian_link(f, out_path)
                     lines.append(f"- {link} ({f['mb']} MB)\n")
-                    added = True
                 lines.append("\n")
 
-        if not added and info["children"]:
-            lines.append("*Carpeta de navegación pura*\n")
+        if not processed_files and info["children"]:
+            lines.append("*Navigation folder*\n")
 
-        lines.append("---\n*Graph Vault 2.2 – La bestia definitiva*")
+        lines.append("---\n*GraphVault v2.3*")
         moc_path.write_text("".join(lines), encoding="utf-8")
 
     def get_obsidian_link(self, file_info, target_folder):
@@ -263,20 +260,21 @@ class GraphVaultPro:
         else:
             proxy = self.attach / f"{file_info['stem']}.md"
             if not proxy.exists():
-                proxy.write_text(f"# {name}\n*Archivo grande → {file_info['mb']} MB*\n`{file_info['path']}`", encoding="utf-8")
+                proxy.write_text(f"# {name}\n*Large file → {file_info['mb']} MB*\n`{file_info['path']}`", encoding="utf-8")
             self.stats["linked"] += 1
             return f"[[!_adjuntos/{file_info['stem']}]]"
 
     def copy_or_link_file(self, file_info, target_folder):
-        if str(file_info["rel"]) in self.processed_files:
-            return
+        if str(file_info["rel"]) in self.processed_files: return
         self.get_obsidian_link(file_info, target_folder)
 
     def sync_deletions(self):
-        print("Sincronizando eliminaciones... ", end="", flush=True)
+        print("\nSyncing deletions...", end="", flush=True)
+        log("Syncing deletions...")
         expected_folders = set(self.folders.keys())
         expected_files = {str(f["rel"]) for info in self.folders.values() for f in info["files"]}
         deleted = 0
+
         for p in self.output.rglob("*"):
             if p.is_dir() and p != self.attach:
                 try:
@@ -300,15 +298,15 @@ class GraphVaultPro:
                 p.unlink()
                 deleted += 1
 
-        print(f"{deleted} elementos eliminados")
+        print(f" → {deleted} items removed")
+        log(f"Sync completed: {deleted} items deleted")
 
     def create_root_index(self):
-        path = self.output / "Índice Principal.md"
-        lines = ["# Índice Principal - Graph Vault 2.2\n\n"]
-
+        path = self.output / "Main Index.md"
+        lines = ["# GraphVault – Main Index\n\n"]
         level1 = [k for k, v in self.folders.items() if v["level"] == 1]
         if level1:
-            lines.append("## Carpetas Principales\n")
+            lines.append("## Top-level Folders\n")
             for k in sorted(level1, key=lambda x: self.folders[x]["name"].lower()):
                 lines.append(f"- [[{self.folders[k]['name']}]]\n")
 
@@ -318,10 +316,10 @@ class GraphVaultPro:
         done_files = len(self.processed_files)
 
         lines += [
-            f"\n## Progreso\n",
-            f"- Carpetas: **{done_f:,}/{total_f:,}** ({done_f/total_f*100:.2f}%)\n",
-            f"- Archivos: **{done_files:,}/{total_files:,}** ({done_files/total_files*100:.2f}%)\n",
-            f"- Archivos copiados: {self.stats['copied']:,} | Enlazados (grandes): {self.stats['linked']:,}\n",
+            f"\n## Status ({datetime.now().strftime('%Y-%m-%d %H:%M')})\n",
+            f"- Folders: **{done_f:,}/{total_f:,}** ({done_f/total_f*100:.1f}%)\n",
+            f"- Files: **{done_files:,}/{total_files:,}** ({done_files/total_files*100:.1f}%)\n",
+            f"- Mode: **{self.mode.upper()}**\n"
         ]
         path.write_text("".join(lines), encoding="utf-8")
 
@@ -330,25 +328,27 @@ class GraphVaultPro:
             "processed_folders": list(self.processed_folders),
             "processed_files": list(self.processed_files),
             "stats": self.stats,
+            "mode": self.mode,
             "batch_idx": self.batch_idx
         }
         try:
             CHECKPOINT_FILE.write_bytes(gzip.compress(json.dumps(data).encode('utf-8')))
-        except: pass
+            log("Checkpoint saved")
+        except: log("ERROR saving checkpoint")
 
     def load_checkpoint(self):
-        if not CHECKPOINT_FILE.exists():
-            return
+        if not CHECKPOINT_FILE.exists(): return
         try:
             raw = gzip.decompress(CHECKPOINT_FILE.read_bytes())
             data = json.loads(raw)
             self.processed_folders = set(data.get("processed_folders", []))
             self.processed_files = set(data.get("processed_files", []))
             self.stats = data.get("stats", {"copied": 0, "linked": 0, "batches": 0})
+            self.mode = data.get("mode", "folders")
             self.batch_idx = data.get("batch_idx", DEFAULT_BATCH_INDEX)
-            print(f"Checkpoint cargado → {self.stats['batches']} lotes procesados")
-        except:
-            print("Checkpoint corrupto → empezando de cero")
+            log(f"Checkpoint loaded → {self.stats['batches']} batches | {len(self.processed_folders):,} folders")
+        except Exception as e:
+            log(f"Corrupted checkpoint → ignored ({e})")
 
     def dashboard(self):
         total_f = len(self.folders)
@@ -356,33 +356,35 @@ class GraphVaultPro:
         total_files = sum(v["file_count"] for v in self.folders.values())
         done_files = len(self.processed_files)
 
-        print("\n" + "═" * 78)
-        print("          GRAPH VAULT 2.2 – LA BESTIA DEFINITIVA")
-        print("═" * 78)
-        print(f"   Carpetas : {done_f:,}/{total_f:,}   ({done_f/total_f*100:6.2f}%)")
-        print(f"   Archivos  : {done_files:,}/{total_files:,}   ({done_files/total_files*100:6.2f}%)")
-        print(f"   Lote      : {BATCH_SIZES[self.batch_idx]:,}  |  Modo: CARPETAS (el único que necesitas)")
+        print("\n" + "═" * 72)
+        print("       GraphVault v2.3 – Ultra-fast Auto-MOC Generator")
+        print("═" * 72)
+        print_progress(done_f, total_f, prefix="FOLDERS ")
+        print_progress(done_files, total_files, prefix="FILES   ")
+        print(f"   Batch: {BATCH_SIZES[self.batch_idx]:,} │ Mode: {self.mode.upper()} │ Log: {LOG_FILE.name}")
         print()
-        print("   [Enter] Procesar lote    1-9 Cambiar tamaño de lote")
-        print("   r Re-escanear todo      s Solo limpiar eliminados")
-        print("   q Salir y guardar")
-        print("─" * 78)
+        print("   [Enter] Process    1-9 Batch size    m Mode    r Rescan    s Sync deletions    q Quit")
+        print("─" * 72)
 
     def run(self):
-        print("GRAPH VAULT 2.2 LISTO – Pulsa Enter para arrasar")
+        print("Ready! Press Enter to start.")
+        log("System ready")
         while True:
             self.dashboard()
             try:
                 cmd = input("→ ").strip().lower()
-                if cmd == "":
-                    self.process_batch()
+                if cmd == "": 
+                    self.process_batch() if self.mode == "folders" else self.process_file_batch()
                 elif cmd in "123456789":
                     idx = int(cmd) - 1
                     if 0 <= idx < len(BATCH_SIZES):
                         self.batch_idx = idx
-                        print(f"Lote → {BATCH_SIZES[idx]:,}")
+                        log(f"Batch size → {BATCH_SIZES[idx]}")
+                elif cmd == "m":
+                    self.mode = "files" if self.mode == "folders" else "folders"
+                    log(f"Mode → {self.mode}")
                 elif cmd == "r":
-                    print("Re-escaneando todo...")
+                    log("RESCANNING EVERYTHING")
                     self.processed_folders.clear()
                     self.processed_files.clear()
                     self.scan()
@@ -390,19 +392,20 @@ class GraphVaultPro:
                 elif cmd == "s":
                     self.sync_deletions()
                 elif cmd == "q":
+                    log("EXITING")
                     self.save_checkpoint()
-                    print("¡Vault guardado! Nos vemos, crack")
+                    print("See you next time!")
                     break
             except KeyboardInterrupt:
-                print("\nGuardando checkpoint y saliendo...")
+                log("INTERRUPTED – Saving state")
                 self.save_checkpoint()
                 break
 
 def main():
     if not INPUT_FOLDER.exists():
-        print("ERROR: Crea la carpeta 'input' al lado del script y mete ahí tu vault")
-        print(f"   Ruta: {SCRIPT_DIR}")
-        input("Enter para salir...")
+        print("\nCREATE A FOLDER NAMED 'input' HERE:")
+        print(f"   {SCRIPT_DIR}")
+        input("Press Enter to exit...")
         return
     with WindowsLock(LOCK_FILE):
         GraphVaultPro().run()
